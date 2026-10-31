@@ -123,6 +123,8 @@ macOS `pf` 不提供适合此场景的可靠“按应用路径”出站过滤，
 
 项目思路受 Windows 版 [yoruuuchan/claude-desktop-killswitch](https://github.com/yoruuuchan/claude-desktop-killswitch) 启发。macOS 实现为独立编写，使用 `pf` 与 `launchd`，未直接移植 PowerShell 代码。
 
+本项目由 ChatGPT（OpenAI Codex）协助设计、实现与验证。
+
 ## License
 
 [MIT](LICENSE)
