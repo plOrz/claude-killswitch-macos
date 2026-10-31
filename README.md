@@ -48,8 +48,8 @@ Anthropic 网段来源：[Anthropic IP addresses](https://platform.claude.com/do
 chmod +x ./claude-killswitch
 ./claude-killswitch check
 sudo ./claude-killswitch install
-sudo claude-killswitch verify
-sudo claude-killswitch status
+sudo /usr/local/sbin/claude-killswitch verify
+sudo /usr/local/sbin/claude-killswitch status
 ```
 
 安装过程会：
@@ -64,7 +64,7 @@ sudo claude-killswitch status
 ## 验证
 
 ```bash
-sudo claude-killswitch verify
+sudo /usr/local/sbin/claude-killswitch verify
 ```
 
 验证不会连接 Anthropic。它会从多个非 Anthropic 诱饵地址中选择一个可达基线，完成：
@@ -78,7 +78,7 @@ sudo claude-killswitch verify
 ## 状态检查
 
 ```bash
-sudo claude-killswitch status
+sudo /usr/local/sbin/claude-killswitch status
 ```
 
 状态页会显示：安装状态、`pf` 状态、自动守护、物理接口覆盖、本地 HTTP 代理、IPv4/IPv6 路由类别。
@@ -86,7 +86,7 @@ sudo claude-killswitch status
 ## 卸载
 
 ```bash
-sudo claude-killswitch uninstall
+sudo /usr/local/sbin/claude-killswitch uninstall
 ```
 
 卸载会：
