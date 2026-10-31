@@ -1,0 +1,554 @@
+#!/bin/bash
+
+set -eu
+
+PRODUCT_NAME="Claude Kill Switch for macOS"
+PRODUCT_VERSION="1.0.0"
+ANCHOR_NAME="io.github.claude-killswitch.macos"
+ANCHOR_FILE="/etc/pf.anchors/${ANCHOR_NAME}"
+PF_CONF="/etc/pf.conf"
+INSTALL_PATH="/usr/local/sbin/claude-killswitch"
+DAEMON_LABEL="io.github.claude-killswitch.macos"
+DAEMON_PLIST="/Library/LaunchDaemons/${DAEMON_LABEL}.plist"
+STATE_DIR="/var/db/${ANCHOR_NAME}"
+STATE_FILE="${STATE_DIR}/state"
+BACKUP_DIR="/var/backups/${ANCHOR_NAME}"
+BEGIN_MARKER="# BEGIN ${ANCHOR_NAME}"
+END_MARKER="# END ${ANCHOR_NAME}"
+ANTHROPIC_IPV4="160.79.104.0/23"
+ANTHROPIC_IPV6="2607:6bc0::/48"
+PUBLIC_IPV6="2000::/3, 64:ff9b::/96, 64:ff9b:1::/48"
+BAIT_CANDIDATES="223.5.5.5:443 1.1.1.1:443 9.9.9.9:443"
+TEMP_DIR=""
+VERIFY_ACTIVE=0
+VERIFY_ROUTE_ADDED=0
+VERIFY_GATEWAY=""
+VERIFY_ADDRESS=""
+
+cleanup() {
+  if [ "$VERIFY_ACTIVE" -eq 1 ]; then
+    /sbin/pfctl -a "$ANCHOR_NAME" -f "$ANCHOR_FILE" >/dev/null 2>&1 || true
+    if [ "$VERIFY_ROUTE_ADDED" -eq 1 ] && [ -n "$VERIFY_GATEWAY" ] && [ -n "$VERIFY_ADDRESS" ]; then
+      /sbin/route -n delete -host "$VERIFY_ADDRESS" "$VERIFY_GATEWAY" >/dev/null 2>&1 || true
+    fi
+  fi
+  if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
+    /bin/rm -rf "$TEMP_DIR"
+  fi
+}
+
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
+
+say() {
+  printf '%s\n' "$*"
+}
+
+fail() {
+  printf '错误：%s\n' "$*" >&2
+  exit 1
+}
+
+require_root() {
+  local action
+  action=$1
+  [ "$(id -u)" -eq 0 ] || fail "请使用 sudo 运行：sudo claude-killswitch ${action}"
+}
+
+make_temp_dir() {
+  mktemp -d "/private/tmp/claude-killswitch.XXXXXX"
+}
+
+physical_interfaces() {
+  /usr/sbin/networksetup -listallhardwareports 2>/dev/null \
+    | awk '
+        /^Hardware Port:/ { port=substr($0, index($0, ":") + 2) }
+        /^Device:/ {
+          device=$2
+          if (device ~ /^en[0-9]+$/ || device ~ /^bridge[0-9]+$/) {
+            print device
+          }
+        }
+      ' \
+    | sort -u
+}
+
+strip_managed_block() {
+  local input_file output_file
+  input_file=$1
+  output_file=$2
+  awk -v begin="$BEGIN_MARKER" -v end="$END_MARKER" '
+    $0 == begin { skipping=1; next }
+    $0 == end { skipping=0; next }
+    !skipping { print }
+  ' "$input_file" > "$output_file"
+}
+
+write_anchor() {
+  local output_file interfaces interface
+  output_file=$1
+  interfaces=$2
+
+  {
+    say "# Managed by ${PRODUCT_NAME} ${PRODUCT_VERSION}"
+    say "# Source: https://platform.claude.com/docs/en/api/ip-addresses"
+    say "table <anthropic_ipv4> const { ${ANTHROPIC_IPV4} }"
+    say "# Block public IPv6 and NAT64 on physical interfaces to prevent proxy bypass."
+    say "table <public_ipv6> const { ${PUBLIC_IPV6} }"
+    say ""
+    printf '%s\n' "$interfaces" | while IFS= read -r interface; do
+      [ -n "$interface" ] || continue
+      say "block drop out quick on ${interface} inet from any to <anthropic_ipv4>"
+      say "block drop out quick on ${interface} inet6 from any to <public_ipv6>"
+    done
+  } > "$output_file"
+}
+
+write_pf_candidate() {
+  local output_file stripped_file
+  output_file=$1
+  stripped_file=$2
+
+  strip_managed_block "$PF_CONF" "$stripped_file"
+  {
+    sed -e '${/^$/d;}' "$stripped_file"
+    say ""
+    say "$BEGIN_MARKER"
+    say "anchor \"${ANCHOR_NAME}\""
+    say "load anchor \"${ANCHOR_NAME}\" from \"${ANCHOR_FILE}\""
+    say "$END_MARKER"
+  } > "$output_file"
+}
+
+pf_status() {
+  /sbin/pfctl -s info 2>/dev/null | awk '/^Status:/ { print $2; exit }'
+}
+
+save_initial_state() {
+  local state_pf backup_file token state_temp
+  state_pf=$1
+  backup_file=$2
+  token=${3:-}
+
+  /bin/mkdir -p "$STATE_DIR"
+  state_temp="${STATE_FILE}.new"
+  {
+    say "PF_WAS_ENABLED=${state_pf}"
+    say "PF_TOKEN=${token}"
+    say "ORIGINAL_BACKUP=${backup_file}"
+  } > "$state_temp"
+  /usr/sbin/chown root:wheel "$state_temp"
+  /bin/chmod 600 "$state_temp"
+  /bin/mv "$state_temp" "$STATE_FILE"
+}
+
+update_state_token() {
+  local pf_was_enabled backup_file token
+  token=$1
+  [ -r "$STATE_FILE" ] || return 0
+  pf_was_enabled=$(awk -F= '/^PF_WAS_ENABLED=/ { print $2; exit }' "$STATE_FILE")
+  backup_file=$(awk -F= '/^ORIGINAL_BACKUP=/ { print $2; exit }' "$STATE_FILE")
+  save_initial_state "$pf_was_enabled" "$backup_file" "$token"
+}
+
+write_daemon_plist() {
+  local output_file
+  output_file=$1
+  {
+    say '<?xml version="1.0" encoding="UTF-8"?>'
+    say '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    say '<plist version="1.0">'
+    say '<dict>'
+    say '  <key>Label</key>'
+    say "  <string>${DAEMON_LABEL}</string>"
+    say '  <key>ProgramArguments</key>'
+    say '  <array>'
+    say "    <string>${INSTALL_PATH}</string>"
+    say '    <string>watch</string>'
+    say '  </array>'
+    say '  <key>RunAtLoad</key>'
+    say '  <true/>'
+    say '  <key>KeepAlive</key>'
+    say '  <true/>'
+    say '  <key>ThrottleInterval</key>'
+    say '  <integer>10</integer>'
+    say '  <key>ProcessType</key>'
+    say '  <string>Background</string>'
+    say '  <key>StandardOutPath</key>'
+    say '  <string>/dev/null</string>'
+    say '  <key>StandardErrorPath</key>'
+    say '  <string>/dev/null</string>'
+    say '</dict>'
+    say '</plist>'
+  } > "$output_file"
+}
+
+daemon_active() {
+  /bin/launchctl print "system/${DAEMON_LABEL}" >/dev/null 2>&1
+}
+
+install_daemon() {
+  local plist_candidate
+  plist_candidate="${TEMP_DIR}/daemon.plist"
+  write_daemon_plist "$plist_candidate"
+  /usr/bin/plutil -lint "$plist_candidate" >/dev/null
+  /usr/bin/install -o root -g wheel -m 644 "$plist_candidate" "$DAEMON_PLIST"
+  /bin/launchctl bootout "system/${DAEMON_LABEL}" >/dev/null 2>&1 || true
+  /bin/launchctl enable "system/${DAEMON_LABEL}" >/dev/null 2>&1 || true
+  /bin/launchctl bootstrap system "$DAEMON_PLIST" >/dev/null
+}
+
+configuration_complete() {
+  local interfaces interface
+  [ -r "$ANCHOR_FILE" ] || return 1
+  grep -qF "$BEGIN_MARKER" "$PF_CONF" || return 1
+  interfaces=$(physical_interfaces)
+  [ -n "$interfaces" ] || return 1
+  printf '%s\n' "$interfaces" | while IFS= read -r interface; do
+    [ -n "$interface" ] || continue
+    grep -q "block drop out quick on ${interface} inet from any to <anthropic_ipv4>" "$ANCHOR_FILE" || exit 9
+    grep -q "block drop out quick on ${interface} inet6 from any to <public_ipv6>" "$ANCHOR_FILE" || exit 9
+  done
+}
+
+runtime_rules_complete() {
+  local interfaces rules interface
+  [ "$(pf_status || true)" = "Enabled" ] || return 1
+  interfaces=$(physical_interfaces)
+  [ -n "$interfaces" ] || return 1
+  rules=$(/sbin/pfctl -a "$ANCHOR_NAME" -sr 2>/dev/null || true)
+  printf '%s\n' "$interfaces" | while IFS= read -r interface; do
+    [ -n "$interface" ] || continue
+    [ "$(printf '%s\n' "$rules" | grep -c " on ${interface} ")" -ge 2 ] || exit 9
+  done
+}
+
+ensure_pf_runtime() {
+  local enable_output pf_token
+  /sbin/pfctl -f "$PF_CONF" >/dev/null 2>&1
+  if [ "$(pf_status || true)" != "Enabled" ]; then
+    enable_output=$(/sbin/pfctl -E 2>&1)
+    pf_token=$(printf '%s\n' "$enable_output" | awk '/Token/ { print $NF; exit }')
+    [ -n "$pf_token" ] && update_state_token "$pf_token"
+  fi
+}
+
+install_rules() {
+  local mode
+  local interfaces anchor_candidate pf_candidate pf_validation pf_stripped
+  local previous_pf previous_anchor timestamp backup_file current_pf
+  local pf_was_enabled pf_token enable_output
+  mode=${1:-install}
+  require_root install
+  [ -r "$PF_CONF" ] || fail "找不到 ${PF_CONF}"
+
+  interfaces=$(physical_interfaces)
+  [ -n "$interfaces" ] || fail "没有识别到物理网络接口"
+
+  TEMP_DIR=$(make_temp_dir)
+  anchor_candidate="${TEMP_DIR}/anchor"
+  pf_candidate="${TEMP_DIR}/pf.conf"
+  pf_validation="${TEMP_DIR}/pf.validation"
+  pf_stripped="${TEMP_DIR}/pf.stripped"
+  previous_pf="${TEMP_DIR}/pf.previous"
+  previous_anchor="${TEMP_DIR}/anchor.previous"
+
+  /bin/cp "$PF_CONF" "$previous_pf"
+  if [ -e "$ANCHOR_FILE" ]; then
+    /bin/cp "$ANCHOR_FILE" "$previous_anchor"
+  fi
+
+  write_anchor "$anchor_candidate" "$interfaces"
+  write_pf_candidate "$pf_candidate" "$pf_stripped"
+  sed "s#${ANCHOR_FILE}#${anchor_candidate}#" "$pf_candidate" > "$pf_validation"
+  /sbin/pfctl -nf "$anchor_candidate" >/dev/null
+  /sbin/pfctl -nf "$pf_validation" >/dev/null
+
+  timestamp=$(/bin/date '+%Y%m%d-%H%M%S')
+  /bin/mkdir -p "$BACKUP_DIR"
+  backup_file="${BACKUP_DIR}/pf.conf.${timestamp}"
+  /bin/cp -p "$PF_CONF" "$backup_file"
+
+  current_pf=$(pf_status || true)
+  if [ "$current_pf" = "Enabled" ]; then
+    pf_was_enabled=1
+  else
+    pf_was_enabled=0
+  fi
+
+  /bin/mkdir -p "$(dirname "$ANCHOR_FILE")" "$(dirname "$INSTALL_PATH")"
+  /usr/bin/install -o root -g wheel -m 644 "$anchor_candidate" "$ANCHOR_FILE"
+  /usr/bin/install -o root -g wheel -m 644 "$pf_candidate" "$PF_CONF"
+  if [ "$mode" = "install" ] && { [ ! -e "$INSTALL_PATH" ] || [ ! "$0" -ef "$INSTALL_PATH" ]; }; then
+    /usr/bin/install -o root -g wheel -m 755 "$0" "$INSTALL_PATH"
+  fi
+
+  if ! /sbin/pfctl -f "$PF_CONF" >/dev/null; then
+    /usr/bin/install -o root -g wheel -m 644 "$previous_pf" "$PF_CONF"
+    if [ -e "$previous_anchor" ]; then
+      /usr/bin/install -o root -g wheel -m 644 "$previous_anchor" "$ANCHOR_FILE"
+    else
+      /bin/rm -f "$ANCHOR_FILE"
+    fi
+    /sbin/pfctl -f "$PF_CONF" >/dev/null 2>&1 || true
+    fail "载入规则失败，已恢复原配置"
+  fi
+
+  pf_token=""
+  if [ "$pf_was_enabled" -eq 0 ]; then
+    enable_output=$(/sbin/pfctl -E 2>&1) || {
+      /usr/bin/install -o root -g wheel -m 644 "$previous_pf" "$PF_CONF"
+      if [ -e "$previous_anchor" ]; then
+        /usr/bin/install -o root -g wheel -m 644 "$previous_anchor" "$ANCHOR_FILE"
+      else
+        /bin/rm -f "$ANCHOR_FILE"
+      fi
+      /sbin/pfctl -f "$PF_CONF" >/dev/null 2>&1 || true
+      fail "启用 pf 失败，已恢复原配置"
+    }
+    pf_token=$(printf '%s\n' "$enable_output" | awk '/Token/ { print $NF; exit }')
+  fi
+
+  if [ ! -e "$STATE_FILE" ]; then
+    save_initial_state "$pf_was_enabled" "$backup_file" "$pf_token"
+  elif [ -n "$pf_token" ]; then
+    update_state_token "$pf_token"
+  fi
+
+  if [ "$mode" = "install" ]; then
+    install_daemon
+    say "${PRODUCT_NAME} 已安装。"
+    say "已保护的物理接口：$(printf '%s' "$interfaces" | paste -sd ',' -)"
+    say "自动守护：已启用"
+    say "请继续运行：sudo claude-killswitch verify"
+  else
+    /bin/rm -rf "$TEMP_DIR"
+    TEMP_DIR=""
+  fi
+}
+
+watch_rules() {
+  require_root watch
+  while :; do
+    if ! configuration_complete; then
+      install_rules repair >/dev/null 2>&1
+    elif ! runtime_rules_complete; then
+      ensure_pf_runtime
+    fi
+    /bin/sleep 10
+  done
+}
+
+route_interface() {
+  local family address
+  family=$1
+  address=$2
+  if [ "$family" = "inet6" ]; then
+    /sbin/route -n get -inet6 "$address" 2>/dev/null | awk '/interface:/ { print $2; exit }'
+  else
+    /sbin/route -n get "$address" 2>/dev/null | awk '/interface:/ { print $2; exit }'
+  fi
+}
+
+classify_route() {
+  local interface interfaces
+  interface=$1
+  interfaces=$2
+  case "$interface" in
+    utun*) say "代理隧道" ;;
+    "") say "不可用" ;;
+    *)
+      if printf '%s\n' "$interfaces" | grep -qx "$interface"; then
+        say "物理接口（由 pf 阻断）"
+      else
+        say "其他接口 ${interface}"
+      fi
+      ;;
+  esac
+}
+
+proxy_health() {
+  local proxy_info enabled host port
+  proxy_info=$(/usr/sbin/scutil --proxy 2>/dev/null || true)
+  enabled=$(printf '%s\n' "$proxy_info" | awk '/HTTPEnable/ { print $3; exit }')
+  host=$(printf '%s\n' "$proxy_info" | awk '/HTTPProxy/ { print $3; exit }')
+  port=$(printf '%s\n' "$proxy_info" | awk '/HTTPPort/ { print $3; exit }')
+
+  if [ "$enabled" = "1" ] && { [ "$host" = "127.0.0.1" ] || [ "$host" = "localhost" ]; } && [ -n "$port" ]; then
+    if /usr/bin/nc -z -G 1 "$host" "$port" >/dev/null 2>&1; then
+      say "可用"
+    else
+      say "已配置但不可达"
+    fi
+  else
+    say "未检测到本地 HTTP 代理"
+  fi
+}
+
+status_rules() {
+  local interfaces pf_now installed rules covered interface ipv4_if ipv6_if daemon
+  require_root status
+  interfaces=$(physical_interfaces)
+  [ -n "$interfaces" ] || fail "没有识别到物理网络接口"
+
+  pf_now=$(pf_status || true)
+  [ -n "$pf_now" ] || pf_now="未知"
+  if [ -e "$ANCHOR_FILE" ] && grep -qF "$BEGIN_MARKER" "$PF_CONF"; then
+    installed="是"
+  else
+    installed="否"
+  fi
+  if daemon_active; then
+    daemon="运行中"
+  else
+    daemon="未运行"
+  fi
+
+  rules=$(/sbin/pfctl -a "$ANCHOR_NAME" -sr 2>/dev/null || true)
+  covered="是"
+  printf '%s\n' "$interfaces" | while IFS= read -r interface; do
+    [ -n "$interface" ] || continue
+    [ "$(printf '%s\n' "$rules" | grep -c " on ${interface} ")" -ge 2 ] || exit 9
+  done || covered="否"
+
+  ipv4_if=$(route_interface inet 160.79.104.1 || true)
+  ipv6_if=$(route_interface inet6 2607:6bc0::1 || true)
+
+  say "${PRODUCT_NAME} ${PRODUCT_VERSION}"
+  say "安装状态：${installed}"
+  say "pf 状态：${pf_now}"
+  say "自动守护：${daemon}"
+  say "物理接口覆盖：${covered}"
+  say "本地代理：$(proxy_health)"
+  say "物理出口公网 IPv6：已阻断（保留局域网与链路本地）"
+  say "Anthropic IPv4 当前路径：$(classify_route "$ipv4_if" "$interfaces")"
+  say "Anthropic IPv6 当前路径：$(classify_route "$ipv6_if" "$interfaces")"
+
+  [ "$installed" = "是" ] && [ "$pf_now" = "Enabled" ] && [ "$covered" = "是" ] && [ "$daemon" = "运行中" ]
+}
+
+verify_rules() {
+  local default_info default_interface default_gateway interfaces verify_anchor
+  local candidate bait_address bait_port
+  require_root verify
+  status_rules >/dev/null || fail "安装状态不完整，请先运行 sudo claude-killswitch install"
+
+  default_info=$(/sbin/route -n get default 2>/dev/null || true)
+  default_interface=$(printf '%s\n' "$default_info" | awk '/interface:/ { print $2; exit }')
+  default_gateway=$(printf '%s\n' "$default_info" | awk '/gateway:/ { print $2; exit }')
+  [ -n "$default_interface" ] || fail "无法识别默认物理接口"
+  [ -n "$default_gateway" ] || fail "无法识别默认网关"
+
+  interfaces=$(physical_interfaces)
+  printf '%s\n' "$interfaces" | grep -qx "$default_interface" \
+    || fail "默认出口不是受保护的物理接口，无法执行安全验收"
+
+  VERIFY_ACTIVE=1
+  VERIFY_GATEWAY=$default_gateway
+  bait_address=""
+  bait_port=""
+  for candidate in $BAIT_CANDIDATES; do
+    VERIFY_ADDRESS=${candidate%:*}
+    bait_port=${candidate##*:}
+    if /sbin/route -n add -host "$VERIFY_ADDRESS" "$default_gateway" >/dev/null 2>&1; then
+      VERIFY_ROUTE_ADDED=1
+      if /usr/bin/nc -z -G 3 "$VERIFY_ADDRESS" "$bait_port" >/dev/null 2>&1; then
+        bait_address=$VERIFY_ADDRESS
+        break
+      fi
+      /sbin/route -n delete -host "$VERIFY_ADDRESS" "$default_gateway" >/dev/null 2>&1 || true
+      VERIFY_ROUTE_ADDED=0
+    fi
+  done
+
+  if [ -z "$bait_address" ]; then
+    fail "诱饵地址基线不可达，无法验证；正式规则保持不变"
+  fi
+
+  TEMP_DIR=$(make_temp_dir)
+  verify_anchor="${TEMP_DIR}/anchor.verify"
+  /bin/cp "$ANCHOR_FILE" "$verify_anchor"
+  say "block drop out quick on ${default_interface} inet from any to ${bait_address}" >> "$verify_anchor"
+  /sbin/pfctl -nf "$verify_anchor" >/dev/null
+
+  /sbin/pfctl -a "$ANCHOR_NAME" -f "$verify_anchor" >/dev/null
+  if /usr/bin/nc -z -G 3 "$bait_address" "$bait_port" >/dev/null 2>&1; then
+    fail "阻断验收失败；正式规则将自动恢复"
+  fi
+
+  /sbin/pfctl -a "$ANCHOR_NAME" -f "$ANCHOR_FILE" >/dev/null
+  if ! /usr/bin/nc -z -G 3 "$bait_address" "$bait_port" >/dev/null 2>&1; then
+    fail "恢复验收失败；请检查当前网络"
+  fi
+
+  say "验收通过：物理接口上的同构规则已完成成功→阻断→恢复 A/B 测试。"
+  say "测试未连接 Anthropic。"
+}
+
+uninstall_rules() {
+  local pf_candidate timestamp pf_was_enabled pf_token
+  require_root uninstall
+  [ -r "$PF_CONF" ] || fail "找不到 ${PF_CONF}"
+
+  /bin/launchctl bootout "system/${DAEMON_LABEL}" >/dev/null 2>&1 || true
+  /bin/rm -f "$DAEMON_PLIST"
+
+  TEMP_DIR=$(make_temp_dir)
+  pf_candidate="${TEMP_DIR}/pf.conf"
+  strip_managed_block "$PF_CONF" "$pf_candidate"
+  /sbin/pfctl -nf "$pf_candidate" >/dev/null
+
+  timestamp=$(/bin/date '+%Y%m%d-%H%M%S')
+  /bin/mkdir -p "$BACKUP_DIR"
+  /bin/cp -p "$PF_CONF" "${BACKUP_DIR}/pf.conf.before-uninstall.${timestamp}"
+
+  pf_was_enabled=1
+  pf_token=""
+  if [ -r "$STATE_FILE" ]; then
+    pf_was_enabled=$(awk -F= '/^PF_WAS_ENABLED=/ { print $2; exit }' "$STATE_FILE")
+    pf_token=$(awk -F= '/^PF_TOKEN=/ { print $2; exit }' "$STATE_FILE")
+  fi
+
+  /usr/bin/install -o root -g wheel -m 644 "$pf_candidate" "$PF_CONF"
+  /bin/rm -f "$ANCHOR_FILE"
+  /sbin/pfctl -f "$PF_CONF" >/dev/null
+
+  if [ "$pf_was_enabled" = "0" ]; then
+    if [ -n "$pf_token" ]; then
+      /sbin/pfctl -X "$pf_token" >/dev/null 2>&1 || /sbin/pfctl -d >/dev/null 2>&1 || true
+    else
+      /sbin/pfctl -d >/dev/null 2>&1 || true
+    fi
+  fi
+
+  /bin/rm -rf "$STATE_DIR"
+  /bin/rm -f "$INSTALL_PATH"
+  say "${PRODUCT_NAME} 已卸载，安装前后的 pf.conf 备份保留在 ${BACKUP_DIR}。"
+}
+
+usage() {
+  say "用法：claude-killswitch <check|install|status|verify|uninstall>"
+}
+
+check_environment() {
+  local interfaces
+  interfaces=$(physical_interfaces)
+  [ -n "$interfaces" ] || fail "没有识别到物理网络接口"
+  say "${PRODUCT_NAME} ${PRODUCT_VERSION}"
+  say "物理接口：$(printf '%s' "$interfaces" | paste -sd ',' -)"
+  say "本地代理：$(proxy_health)"
+  say "将阻断的目标：Anthropic 官方 IPv4，以及物理出口上的公网 IPv6/NAT64"
+  say "不会修改 Clash Verge、Claude、账号、钥匙串或系统代理设置。"
+}
+
+command=${1:-}
+case "$command" in
+  check) check_environment ;;
+  install) install_rules ;;
+  status) status_rules ;;
+  verify) verify_rules ;;
+  uninstall) uninstall_rules ;;
+  watch) watch_rules ;;
+  -h|--help|help) usage ;;
+  *) usage; exit 2 ;;
+esac
