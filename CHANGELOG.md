@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.2 - 2026-11-09
+
+- Add Anthropic's newly published inbound IPv4 range to the physical-interface block table.
+- Reinstalling this release refreshes the managed `pf` anchor with both current inbound IPv4 ranges.
+
 ## 1.0.1 - 2026-10-31
 
 - Use the absolute installed path in post-install commands and guidance.
